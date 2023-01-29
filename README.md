@@ -10,8 +10,11 @@ git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarc
 then:
 
 mkdir KERNEL_OUT
+
 cp config KERNEL_OUT/.config
+
 make O=../KERNEL_OUT -C kernel-gemini-binder-backport ARCH=arm64 menuconfig
+
 make O=../KERNEL_OUT -C kernel-gemini-binder-backport ARCH=arm64  CROSS_COMPILE=../aarch64-linux-android-4.9/bin/aarch64-linux-android- -j10
 
 Flashable boot.img can be created with:
