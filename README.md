@@ -1,7 +1,7 @@
 # kernel-gemini-binder-backport
 Gemini PDA kernel for SailfishOS with binder driver backported from 4.14. The intent of this backport is to allow waydroid on the Gemini+Sailfish
 
-Building Instructions:
+Building Instructions (tested on Debian Stretch and ubuntu 20.04 VMs):
 
 Download prebuilt gcc:
 
