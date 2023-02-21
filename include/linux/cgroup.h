@@ -22,6 +22,7 @@
 #include <linux/seq_file.h>
 #include <linux/kernfs.h>
 #include <linux/wait.h>
+#include <linux/psi_types.h>
 
 #ifdef CONFIG_CGROUPS
 
@@ -241,6 +242,8 @@ struct cgroup {
 
 	/* used to schedule release agent */
 	struct work_struct release_agent_work;
+
+	struct psi_group psi;
 };
 
 #define MAX_CGROUP_ROOT_NAMELEN 64
@@ -576,6 +579,11 @@ static inline void pr_cont_cgroup_name(struct cgroup *cgrp)
 static inline void pr_cont_cgroup_path(struct cgroup *cgrp)
 {
 	pr_cont_kernfs_path(cgrp->kn);
+}
+
+static inline struct psi_group *cgroup_psi(struct cgroup *cgrp)
+{
+	return &cgrp->psi;
 }
 
 char *task_cgroup_path(struct task_struct *task, char *buf, size_t buflen);
@@ -923,6 +931,14 @@ struct cgroup_subsys_state *css_tryget_online_from_dir(struct dentry *dentry,
 int subsys_cgroup_allow_attach(struct cgroup_subsys_state *css,
 			       struct cgroup_taskset *tset);
 
+static inline struct cgroup *cgroup_parent(struct cgroup *cgrp)
+{
+	struct cgroup_subsys_state *parent_css = cgrp->self.parent;
+
+	if (parent_css)
+		return container_of(parent_css, struct cgroup, self);
+	return NULL;
+}
 
 #else /* !CONFIG_CGROUPS */
 
@@ -931,6 +947,16 @@ static inline int cgroup_init(void) { return 0; }
 static inline void cgroup_fork(struct task_struct *p) {}
 static inline void cgroup_post_fork(struct task_struct *p) {}
 static inline void cgroup_exit(struct task_struct *p) {}
+
+static inline struct cgroup *cgroup_parent(struct cgroup *cgrp)
+{
+	return NULL;
+}
+
+static inline struct psi_group *cgroup_psi(struct cgroup *cgrp)
+{
+	return NULL;
+}
 
 static inline int cgroupstats_build(struct cgroupstats *stats,
 					struct dentry *dentry)
@@ -950,6 +976,8 @@ static inline int subsys_cgroup_allow_attach(struct cgroup_subsys_state *css,
 {
 	return -EINVAL;
 }
+
+
 #endif /* !CONFIG_CGROUPS */
 
 #endif /* _LINUX_CGROUP_H */

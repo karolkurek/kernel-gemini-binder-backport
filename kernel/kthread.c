@@ -526,6 +526,7 @@ void __init_kthread_worker(struct kthread_worker *worker,
 	spin_lock_init(&worker->lock);
 	lockdep_set_class_and_name(&worker->lock, key, name);
 	INIT_LIST_HEAD(&worker->work_list);
+	INIT_LIST_HEAD(&worker->delayed_work_list);
 	worker->task = NULL;
 }
 EXPORT_SYMBOL_GPL(__init_kthread_worker);
@@ -552,6 +553,10 @@ int kthread_worker_fn(void *worker_ptr)
 
 	WARN_ON(worker->task);
 	worker->task = current;
+
+	if (worker->flags & KTW_FREEZABLE)
+		set_freezable();
+
 repeat:
 	set_current_state(TASK_INTERRUPTIBLE);	/* mb paired w/ kthread_stop */
 
@@ -621,6 +626,200 @@ bool queue_kthread_work(struct kthread_worker *worker,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(queue_kthread_work);
+
+static __printf(3, 0) struct kthread_worker *
+__kthread_create_worker(int cpu, unsigned int flags,
+			const char namefmt[], va_list args)
+{
+	struct kthread_worker *worker;
+	struct task_struct *task;
+	int node = -1;
+
+	worker = kzalloc(sizeof(*worker), GFP_KERNEL);
+	if (!worker)
+		return ERR_PTR(-ENOMEM);
+
+	init_kthread_worker(worker);
+
+	if (cpu >= 0)
+		node = cpu_to_node(cpu);
+
+	//task = __kthread_create_on_node(kthread_worker_fn, worker,
+	task = kthread_create_on_node(kthread_worker_fn, worker,
+						node, namefmt, args);
+	if (IS_ERR(task))
+		goto fail_task;
+
+	if (cpu >= 0)
+		kthread_bind(task, cpu);
+
+	worker->flags = flags;
+	worker->task = task;
+	wake_up_process(task);
+	return worker;
+
+fail_task:
+	kfree(worker);
+	return ERR_CAST(task);
+}
+
+/**
+ * kthread_create_worker - create a kthread worker
+ * @flags: flags modifying the default behavior of the worker
+ * @namefmt: printf-style name for the kthread worker (task).
+ *
+ * Returns a pointer to the allocated worker on success, ERR_PTR(-ENOMEM)
+ * when the needed structures could not get allocated, and ERR_PTR(-EINTR)
+ * when the worker was SIGKILLed.
+ */
+struct kthread_worker *
+kthread_create_worker(unsigned int flags, const char namefmt[], ...)
+{
+	struct kthread_worker *worker;
+	va_list args;
+
+	va_start(args, namefmt);
+	worker = __kthread_create_worker(-1, flags, namefmt, args);
+	va_end(args);
+
+	return worker;
+}
+EXPORT_SYMBOL(kthread_create_worker);
+
+/*
+ * Returns true when the work could not be queued at the moment.
+ * It happens when it is already pending in a worker list
+ * or when it is being cancelled.
+ */
+static inline bool queuing_blocked(struct kthread_worker *worker,
+				   struct kthread_work *work)
+{
+	lockdep_assert_held(&worker->lock);
+
+	return !list_empty(&work->node) || work->canceling;
+}
+
+static void kthread_insert_work_sanity_check(struct kthread_worker *worker,
+					     struct kthread_work *work)
+{
+	lockdep_assert_held(&worker->lock);
+	WARN_ON_ONCE(!list_empty(&work->node));
+	/* Do not use a work with >1 worker, see kthread_queue_work() */
+	WARN_ON_ONCE(work->worker && work->worker != worker);
+}
+
+/* insert @work before @pos in @worker */
+static void kthread_insert_work(struct kthread_worker *worker,
+				struct kthread_work *work,
+				struct list_head *pos)
+{
+	kthread_insert_work_sanity_check(worker, work);
+
+	list_add_tail(&work->node, pos);
+	work->worker = worker;
+	if (!worker->current_work && likely(worker->task))
+		wake_up_process(worker->task);
+}
+
+/**
+ * kthread_delayed_work_timer_fn - callback that queues the associated kthread
+ *	delayed work when the timer expires.
+ * @__data: pointer to the data associated with the timer
+ *
+ * The format of the function is defined by struct timer_list.
+ * It should have been called from irqsafe timer with irq already off.
+ */
+void kthread_delayed_work_timer_fn(unsigned long __data)
+{
+	struct kthread_delayed_work *dwork =
+		(struct kthread_delayed_work *)__data;
+	struct kthread_work *work = &dwork->work;
+	struct kthread_worker *worker = work->worker;
+
+	/*
+	 * This might happen when a pending work is reinitialized.
+	 * It means that it is used a wrong way.
+	 */
+	if (WARN_ON_ONCE(!worker))
+		return;
+
+	spin_lock(&worker->lock);
+	/* Work must not be used with >1 worker, see kthread_queue_work(). */
+	WARN_ON_ONCE(work->worker != worker);
+
+	/* Move the work from worker->delayed_work_list. */
+	WARN_ON_ONCE(list_empty(&work->node));
+	list_del_init(&work->node);
+	kthread_insert_work(worker, work, &worker->work_list);
+
+	spin_unlock(&worker->lock);
+}
+EXPORT_SYMBOL(kthread_delayed_work_timer_fn);
+
+void __kthread_queue_delayed_work(struct kthread_worker *worker,
+				  struct kthread_delayed_work *dwork,
+				  unsigned long delay)
+{
+	struct timer_list *timer = &dwork->timer;
+	struct kthread_work *work = &dwork->work;
+
+	WARN_ON_ONCE(timer->function != kthread_delayed_work_timer_fn ||
+		     timer->data != (unsigned long)dwork);
+
+	/*
+	 * If @delay is 0, queue @dwork->work immediately.  This is for
+	 * both optimization and correctness.  The earliest @timer can
+	 * expire is on the closest next tick and delayed_work users depend
+	 * on that there's no such delay when @delay is 0.
+	 */
+	if (!delay) {
+		kthread_insert_work(worker, work, &worker->work_list);
+		return;
+	}
+
+	/* Be paranoid and try to detect possible races already now. */
+	kthread_insert_work_sanity_check(worker, work);
+
+	list_add(&work->node, &worker->delayed_work_list);
+	work->worker = worker;
+	timer->expires = jiffies + delay;
+	add_timer(timer);
+}
+
+/**
+ * kthread_queue_delayed_work - queue the associated kthread work
+ *	after a delay.
+ * @worker: target kthread_worker
+ * @dwork: kthread_delayed_work to queue
+ * @delay: number of jiffies to wait before queuing
+ *
+ * If the work has not been pending it starts a timer that will queue
+ * the work after the given @delay. If @delay is zero, it queues the
+ * work immediately.
+ *
+ * Return: %false if the @work has already been pending. It means that
+ * either the timer was running or the work was queued. It returns %true
+ * otherwise.
+ */
+bool kthread_queue_delayed_work(struct kthread_worker *worker,
+				struct kthread_delayed_work *dwork,
+				unsigned long delay)
+{
+	struct kthread_work *work = &dwork->work;
+	unsigned long flags;
+	bool ret = false;
+
+	spin_lock_irqsave(&worker->lock, flags);
+
+	if (!queuing_blocked(worker, work)) {
+		__kthread_queue_delayed_work(worker, dwork, delay);
+		ret = true;
+	}
+
+	spin_unlock_irqrestore(&worker->lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(kthread_queue_delayed_work);
 
 struct kthread_flush_work {
 	struct kthread_work	work;
@@ -692,3 +891,141 @@ void flush_kthread_worker(struct kthread_worker *worker)
 	wait_for_completion(&fwork.done);
 }
 EXPORT_SYMBOL_GPL(flush_kthread_worker);
+
+/*
+ * This function removes the work from the worker queue. Also it makes sure
+ * that it won't get queued later via the delayed work's timer.
+ *
+ * The work might still be in use when this function finishes. See the
+ * current_work proceed by the worker.
+ *
+ * Return: %true if @work was pending and successfully canceled,
+ *	%false if @work was not pending
+ */
+static bool __kthread_cancel_work(struct kthread_work *work, bool is_dwork,
+				  unsigned long *flags)
+{
+	/* Try to cancel the timer if exists. */
+	if (is_dwork) {
+		struct kthread_delayed_work *dwork =
+			container_of(work, struct kthread_delayed_work, work);
+		struct kthread_worker *worker = work->worker;
+
+		/*
+		 * del_timer_sync() must be called to make sure that the timer
+		 * callback is not running. The lock must be temporary released
+		 * to avoid a deadlock with the callback. In the meantime,
+		 * any queuing is blocked by setting the canceling counter.
+		 */
+		work->canceling++;
+		spin_unlock_irqrestore(&worker->lock, *flags);
+		del_timer_sync(&dwork->timer);
+		spin_lock_irqsave(&worker->lock, *flags);
+		work->canceling--;
+	}
+
+	/*
+	 * Try to remove the work from a worker list. It might either
+	 * be from worker->work_list or from worker->delayed_work_list.
+	 */
+	if (!list_empty(&work->node)) {
+		list_del_init(&work->node);
+		return true;
+	}
+
+	return false;
+}
+
+static bool __kthread_cancel_work_sync(struct kthread_work *work, bool is_dwork)
+{
+	struct kthread_worker *worker = work->worker;
+	unsigned long flags;
+	int ret = false;
+
+	if (!worker)
+		goto out;
+
+	spin_lock_irqsave(&worker->lock, flags);
+	/* Work must not be used with >1 worker, see kthread_queue_work(). */
+	WARN_ON_ONCE(work->worker != worker);
+
+	ret = __kthread_cancel_work(work, is_dwork, &flags);
+
+	if (worker->current_work != work)
+		goto out_fast;
+
+	/*
+	 * The work is in progress and we need to wait with the lock released.
+	 * In the meantime, block any queuing by setting the canceling counter.
+	 */
+	work->canceling++;
+	spin_unlock_irqrestore(&worker->lock, flags);
+	flush_kthread_work(work);
+	spin_lock_irqsave(&worker->lock, flags);
+	work->canceling--;
+
+out_fast:
+	spin_unlock_irqrestore(&worker->lock, flags);
+out:
+	return ret;
+}
+
+/**
+ * kthread_cancel_work_sync - cancel a kthread work and wait for it to finish
+ * @work: the kthread work to cancel
+ *
+ * Cancel @work and wait for its execution to finish.  This function
+ * can be used even if the work re-queues itself. On return from this
+ * function, @work is guaranteed to be not pending or executing on any CPU.
+ *
+ * kthread_cancel_work_sync(&delayed_work->work) must not be used for
+ * delayed_work's. Use kthread_cancel_delayed_work_sync() instead.
+ *
+ * The caller must ensure that the worker on which @work was last
+ * queued can't be destroyed before this function returns.
+ *
+ * Return: %true if @work was pending, %false otherwise.
+ */
+bool kthread_cancel_work_sync(struct kthread_work *work)
+{
+	return __kthread_cancel_work_sync(work, false);
+}
+EXPORT_SYMBOL_GPL(kthread_cancel_work_sync);
+
+/**
+ * kthread_cancel_delayed_work_sync - cancel a kthread delayed work and
+ *	wait for it to finish.
+ * @dwork: the kthread delayed work to cancel
+ *
+ * This is kthread_cancel_work_sync() for delayed works.
+ *
+ * Return: %true if @dwork was pending, %false otherwise.
+ */
+bool kthread_cancel_delayed_work_sync(struct kthread_delayed_work *dwork)
+{
+	return __kthread_cancel_work_sync(&dwork->work, true);
+}
+EXPORT_SYMBOL_GPL(kthread_cancel_delayed_work_sync);
+
+/**
+ * kthread_destroy_worker - destroy a kthread worker
+ * @worker: worker to be destroyed
+ *
+ * Flush and destroy @worker.  The simple flush is enough because the kthread
+ * worker API is used only in trivial scenarios.  There are no multi-step state
+ * machines needed.
+ */
+void kthread_destroy_worker(struct kthread_worker *worker)
+{
+	struct task_struct *task;
+
+	task = worker->task;
+	if (WARN_ON(!task))
+		return;
+
+	flush_kthread_worker(worker);
+	kthread_stop(task);
+	WARN_ON(!list_empty(&worker->work_list));
+	kfree(worker);
+}
+EXPORT_SYMBOL(kthread_destroy_worker);

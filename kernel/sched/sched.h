@@ -8,6 +8,7 @@
 #include <linux/stop_machine.h>
 #include <linux/tick.h>
 #include <linux/slab.h>
+#include <linux/psi.h>
 
 #include "cpupri.h"
 #include "cpudeadline.h"
@@ -181,6 +182,7 @@ extern struct mutex sched_domains_mutex;
 #ifdef CONFIG_CGROUP_SCHED
 
 #include <linux/cgroup.h>
+#include <linux/psi.h>
 
 struct cfs_rq;
 struct rt_rq;
@@ -695,6 +697,105 @@ static inline u64 rq_clock(struct rq *rq)
 static inline u64 rq_clock_task(struct rq *rq)
 {
 	return rq->clock_task;
+}
+
+struct rq_flags {
+	unsigned long flags;
+	struct pin_cookie cookie;
+#ifdef CONFIG_SCHED_DEBUG
+	/*
+	 * A copy of (rq::clock_update_flags & RQCF_UPDATED) for the
+	 * current pin context is stashed here in case it needs to be
+	 * restored in rq_repin_lock().
+	 */
+	unsigned int clock_update_flags;
+#endif
+};
+
+static inline void rq_pin_lock(struct rq *rq, struct rq_flags *rf)
+{
+        rf->cookie = lockdep_pin_lock(&rq->lock);
+
+#ifdef CONFIG_SCHED_DEBUG
+        rq->clock_update_flags &= (RQCF_REQ_SKIP|RQCF_ACT_SKIP);
+        rf->clock_update_flags = 0;
+#endif
+}
+
+static inline void rq_unpin_lock(struct rq *rq, struct rq_flags *rf)
+{
+#ifdef CONFIG_SCHED_DEBUG
+        if (rq->clock_update_flags > RQCF_ACT_SKIP)
+                rf->clock_update_flags = RQCF_UPDATED;
+#endif
+
+        lockdep_unpin_lock(&rq->lock, rf->cookie);
+}
+
+static inline void rq_repin_lock(struct rq *rq, struct rq_flags *rf)
+{
+        lockdep_repin_lock(&rq->lock, rf->cookie);
+
+#ifdef CONFIG_SCHED_DEBUG
+        /*
+         * Restore the value we stashed in @rf for this pin context.
+         */
+        rq->clock_update_flags |= rf->clock_update_flags;
+#endif
+}
+
+//4.14
+
+static inline void
+rq_lock2(struct rq *rq, struct rq_flags *rf)
+	__acquires(rq->lock)
+{
+	raw_spin_lock(&rq->lock);
+	rq_pin_lock(rq, rf);
+}
+
+static inline struct rq *
+this_rq_lock_irq(struct rq_flags *rf)
+	__acquires(rq->lock)
+{
+	struct rq *rq;
+
+	local_irq_disable();
+	rq = this_rq();
+	rq_lock2(rq, rf);
+	return rq;
+}
+
+static inline void
+rq_unlock_irq(struct rq *rq, struct rq_flags *rf)
+	__releases(rq->lock)
+{
+	rq_unpin_lock(rq, rf);
+	raw_spin_unlock_irq(&rq->lock);
+}
+
+struct rq *__task_rq_lock3(struct task_struct *p, struct rq_flags *rf)
+	__acquires(rq->lock);
+
+
+struct rq *task_rq_lock3(struct task_struct *p, struct rq_flags *rf)
+	__acquires(p->pi_lock)
+	__acquires(rq->lock);
+
+static inline void __task_rq_unlock3(struct rq *rq, struct rq_flags *rf)
+	__releases(rq->lock)
+{
+	rq_unpin_lock(rq, rf);
+	raw_spin_unlock(&rq->lock);
+}
+static inline void
+task_rq_unlock3(struct rq *rq, struct task_struct *p, struct rq_flags *rf)
+	__releases(rq->lock)
+	__releases(p->pi_lock)
+{
+	rq_unpin_lock(rq, rf);
+	raw_spin_unlock(&rq->lock);
+	raw_spin_unlock_irqrestore(&p->pi_lock, rf->flags);
 }
 
 #ifdef CONFIG_NUMA_BALANCING

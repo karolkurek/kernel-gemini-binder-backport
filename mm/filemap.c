@@ -35,6 +35,7 @@
 #include <linux/memcontrol.h>
 #include <linux/cleancache.h>
 #include <linux/rmap.h>
+#include <linux/psi.h>
 #include "internal.h"
 
 #define CREATE_TRACE_POINTS
@@ -680,11 +681,23 @@ EXPORT_SYMBOL(page_waitqueue);
 
 void wait_on_page_bit(struct page *page, int bit_nr)
 {
+	bool thrashing = false;
+	unsigned long pflags;
+
 	DEFINE_WAIT_BIT(wait, &page->flags, bit_nr);
+
+	if (bit_nr == PG_locked &&
+	    !PageUptodate(page)) { // && PageWorkingset(page)) {
+		psi_memstall_enter(&pflags);
+		thrashing = true;
+	}
 
 	if (test_bit(bit_nr, &page->flags))
 		__wait_on_bit(page_waitqueue(page), &wait, bit_wait_io,
 							TASK_UNINTERRUPTIBLE);
+	if (thrashing) {
+		psi_memstall_leave(&pflags);
+	}
 }
 EXPORT_SYMBOL(wait_on_page_bit);
 

@@ -356,6 +356,10 @@ static inline void lock_set_subclass(struct lockdep_map *lock,
 	lock_set_class(lock, lock->name, lock->key, subclass, ip);
 }
 
+struct pin_cookie { unsigned int val; };
+
+#define NIL_COOKIE (struct pin_cookie){ .val = 0U, }
+
 extern void lockdep_set_current_reclaim_state(gfp_t gfp_mask);
 extern void lockdep_clear_current_reclaim_state(void);
 extern void lockdep_trace_alloc(gfp_t mask);
@@ -425,6 +429,15 @@ struct lock_class_key { };
 #define lockdep_assert_held_once(l)		do { (void)(l); } while (0)
 
 #define lockdep_recursing(tsk)			(0)
+
+struct pin_cookie { };
+
+#define NIL_COOKIE (struct pin_cookie){ }
+
+#define lockdep_pin_lock(l)			({ struct pin_cookie cookie; cookie; })
+#define lockdep_repin_lock(l, c)		do { (void)(l); (void)(c); } while (0)
+#define lockdep_unpin_lock(l, c)		do { (void)(l); (void)(c); } while (0)
+
 
 #endif /* !LOCKDEP */
 
